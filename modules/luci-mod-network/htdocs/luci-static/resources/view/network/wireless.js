@@ -523,7 +523,7 @@ function formatConfigEncryption(enc) {
 }
 
 // Keep an incompatible saved value visible as invalid, never silently replace it.
-function restrictQca6GHzChoices(option, getBand, allowed, message) {
+function restrict6GHzChoices(option, getBand, allowed, message) {
 	let widget, section;
 	const update = function() {
 		if (!widget)
@@ -678,7 +678,8 @@ function getDisplayTxPower(radioNet) {
 		if (isPlausibleTxPowerValue(info != null ? info.txpower : null, hwtype))
 			return info.txpower;
 
-	if (isPlausibleTxPowerValue(cfgvalue, hwtype))
+	// mt_dbdc configures power as a percentage, not dBm.
+	if (hwtype != 'mt_dbdc' && isPlausibleTxPowerValue(cfgvalue, hwtype))
 		return cfgvalue;
 
 	return null;
@@ -1404,7 +1405,9 @@ function getDisplaySignalPercent(radioNet, hwtype, is_assoc, disabled) {
 }
 
 function getDisplaySignalValue(radioNet, hwtype, is_assoc) {
-	if ((hwtype == 'mt_dbdc' || (isQcaWifiHwtype(hwtype) && radioNet.getMode() == 'ap')) && is_assoc)
+	if (hwtype == 'mt_dbdc' && radioNet.getMode() == 'ap')
+		return is_assoc ? getDisplayTxPower(radioNet) : null;
+	if (isQcaWifiHwtype(hwtype) && radioNet.getMode() == 'ap' && is_assoc)
 		return getDisplayTxPower(radioNet) ?? 30;
 
 	return radioNet.getSignal();
@@ -1437,7 +1440,7 @@ function renderStatusRow(pairs, className) {
 	return added ? row : null;
 }
 
-function render_signal_badge(signalPercent, signalValue, noiseValue, wrap, mode) {
+function render_signal_badge(signalPercent, signalValue, noiseValue, wrap, mode, txpower = false) {
 	let icon = L.resource('icons/signal-075-100.svg'), title, value;
 
 	switch(true) {
@@ -1459,13 +1462,13 @@ function render_signal_badge(signalPercent, signalValue, noiseValue, wrap, mode)
 		}
 		else {
 			value = `${signalValue}\xa0${_('dBm')}`;
-			title = `${_('Signal')} ${signalValue} ${_('dBm')}`;
+			title = `${txpower ? _('Tx-Power') : _('Signal')} ${signalValue} ${_('dBm')}`;
 		}
 	}
 	else if (signalPercent > -1) {
 		switch (mode) {
 			case 'ap':
-				title = _('No client associated');
+				title = txpower ? _('Tx-Power') : _('No client associated');
 				break;
 
 			case 'sta':
@@ -1516,7 +1519,8 @@ function render_network_badge(radioNet) {
 	return render_signal_badge(
 		getDisplaySignalPercent(radioNet, hwtype, is_assoc, disabled),
 		getDisplaySignalValue(radioNet, hwtype, is_assoc),
-		getDisplayNoiseValue(radioNet, hwtype, is_assoc), false, radioNet.getMode());
+		getDisplayNoiseValue(radioNet, hwtype, is_assoc), false, radioNet.getMode(),
+		hwtype == 'mt_dbdc' && radioNet.getMode() == 'ap');
 }
 
 function render_radio_status(radioDev, wifiNets) {
@@ -1591,7 +1595,8 @@ function render_modal_status(node, radioNet) {
 
 	dom.content(node.firstElementChild, render_signal_badge(
 		getDisplaySignalPercent(radioNet, hwtype, is_assoc, disabled),
-		getDisplaySignalValue(radioNet, hwtype, is_assoc), noise, true, radioNet.getMode()));
+		getDisplaySignalValue(radioNet, hwtype, is_assoc), noise, true, radioNet.getMode(),
+		hwtype == 'mt_dbdc' && radioNet.getMode() == 'ap'));
 
 	L.itemlist(node.lastElementChild, [
 		_('Mode'),       mode,
@@ -2029,7 +2034,11 @@ var CBIWifiFrequencyValue = form.Value.extend({
 
 		if (Number.isInteger(vals?.selected)) sel.selectedIndex = vals.selected;
 
-		sel.parentNode.style.display = (sel.options.length <= (sel.classList.contains('band') ? 0 : 1)) ? 'none' : '';
+		const showFixedWidth = this.hwtype == 'mt_dbdc' &&
+			sel.classList.contains('htmode') && sel.options.length == 1 &&
+			sel.options[0].value == 'EHT320';
+		const minOptions = (sel.classList.contains('band') || showFixedWidth) ? 0 : 1;
+		sel.parentNode.style.display = sel.options.length <= minOptions ? 'none' : '';
 		sel.vals = vals;
 	},
 
@@ -2113,6 +2122,10 @@ var CBIWifiFrequencyValue = form.Value.extend({
 			const valueName = String(value || '');
 
 			if (bandName == '2g' && /(80_80|80|160|320)/.test(valueName))
+				meta.available = false;
+
+			if (this.hwtype == 'mt_dbdc' && bandName == '6g' &&
+			    /^EHT/.test(valueName) && valueName != 'EHT320')
 				meta.available = false;
 
 			if (bandName != '6g' && /320/.test(valueName))
@@ -2364,6 +2377,13 @@ var CBIWifiFrequencyValue = form.Value.extend({
 			node.querySelector('.band').value,
 			node.querySelector('.channel').value
 		];
+	},
+
+	validate: function(section_id, value) {
+		if (this.hwtype == 'mt_dbdc' && value && value[2] == '6g' &&
+		    value[0] == 'be' && value[1] != 'EHT320')
+			return _('This 6 GHz Wi-Fi 7 profile requires 320 MHz.');
+		return true;
 	},
 
 	write: function(section_id, value) {
@@ -2973,6 +2993,12 @@ return view.extend({
 					o.default = o.enabled;
 					o.rmempty = false;
 
+					o = ss.taboption('advanced', form.Flag, 'csa', _('Enable CSA'), _('Announce channel switches to clients. Automatic channel selection remains available when disabled.'));
+					o.depends({ '_freq': '6g', '!contains': true });
+					o.ucisection = radioNet.getWifiDeviceName();
+					o.default = o.disabled;
+					o.rmempty = false;
+
 					o = ss.taboption('advanced', form.Flag, 'mu_beamformer', _('MU-MIMO'));
 
 					if (uci.get('wireless', radioNet.getWifiDeviceName(), 'dbdc_main') == '1') {
@@ -3343,6 +3369,9 @@ return view.extend({
 					if ((e == 'sae' || e == 'sae-mixed') && (!c || c == 'auto'))
 						c = 'ccmp';
 
+					if (hwtype == 'mt_dbdc' && getSecurityBand() == '6g')
+						uci.set('wireless', section_id, 'ieee80211w', '2');
+
 					if (isQcaWifiHwtype(hwtype)) {
 						if (e == 'owe') {
 							stored_e = 'ccmp';
@@ -3579,11 +3608,13 @@ return view.extend({
 					encr.value(crypto_mode[0], '%s (%s)'.format(crypto_mode[1], security_level));
 				});
 
-				if (isQcaWifiHwtype(hwtype)) {
-					const updateEncryption = restrictQca6GHzChoices(encr, getSecurityBand,
-						['sae', 'owe'], _('6 GHz requires WPA3-SAE or OWE.'));
-					const updateCipher = restrictQca6GHzChoices(cipherOption, getSecurityBand,
-						['auto', 'ccmp', 'ccmp256', 'gcmp', 'gcmp256'], _('TKIP is not supported on 6 GHz.'));
+				if (isQcaWifiHwtype(hwtype) || hwtype == 'mt_dbdc') {
+					const updateEncryption = restrict6GHzChoices(encr, getSecurityBand,
+						['sae', 'owe'],
+						_('6 GHz requires WPA3-SAE or OWE.'));
+					const updateCipher = restrict6GHzChoices(cipherOption, getSecurityBand,
+						hwtype == 'mt_dbdc' ? ['auto', 'ccmp'] : ['auto', 'ccmp', 'ccmp256', 'gcmp', 'gcmp256'],
+						hwtype == 'mt_dbdc' ? _('This 6 GHz profile requires CCMP (AES).') : _('TKIP is not supported on 6 GHz.'));
 					frequencyOption.onBandChange = function() {
 						updateEncryption();
 						updateCipher();
